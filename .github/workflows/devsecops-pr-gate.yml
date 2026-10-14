@@ -1,0 +1,100 @@
+# Copy this file to .github/workflows/devsecops-pr-gate.yml
+# in Crabs536/wrongsecrets (master branch).
+# The toolkit stays in the separate public repo Crabs536/DevSecOps_Pipeline.
+name: DevSecOps PR Security Gate
+
+on:
+  pull_request:
+    branches: [master]
+
+# Do not use pull_request_target or expose repository secrets to untrusted PRs.
+permissions:
+  contents: read
+
+jobs:
+  pr-security-gate:
+    name: pr-security-gate
+    runs-on: ubuntu-24.04
+    timeout-minutes: 60
+    env:
+      DEVSECOPS_TOOL_DIR: ${{ runner.temp }}/devsecops-cli
+
+    steps:
+      - name: Checkout DevSecOps toolkit (trusted separate repository)
+        uses: actions/checkout@v4
+        with:
+          repository: Crabs536/DevSecOps_Pipeline
+          ref: main  # POC: pin to an audited commit SHA before production use.
+          path: devsecops-tool
+          persist-credentials: false
+
+      - name: Checkout baseline from target master commit
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ github.event.pull_request.base.sha }}
+          path: baseline
+          persist-credentials: false
+
+      - name: Checkout pull request test-merge snapshot
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ github.sha }}
+          path: candidate
+          persist-credentials: false
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+
+      - name: Install scanners and verify toolkit
+        shell: bash
+        run: |
+          set -euo pipefail
+          test -f devsecops-tool/devsecops.py
+          test -f devsecops-tool/security-policy.json
+          test -f devsecops-tool/requirements.txt
+          python -m pip install --upgrade pip
+          python -m pip install -r devsecops-tool/requirements.txt
+          python devsecops-tool/devsecops.py setup-tools
+          python devsecops-tool/devsecops.py doctor
+          python devsecops-tool/devsecops.py self-test
+
+      - name: Scan baseline (collect only)
+        shell: bash
+        run: |
+          python devsecops-tool/devsecops.py scan \
+            --target baseline \
+            --out scan-results/base \
+            --policy devsecops-tool/security-policy.json \
+            --fail-on none \
+            --jobs 4
+
+      - name: Scan PR candidate (collect only)
+        shell: bash
+        run: |
+          python devsecops-tool/devsecops.py scan \
+            --target candidate \
+            --out scan-results/pr \
+            --policy devsecops-tool/security-policy.json \
+            --fail-on none \
+            --jobs 4
+
+      - name: Evaluate PR security gate
+        shell: bash
+        run: |
+          python devsecops-tool/devsecops.py compare \
+            --baseline scan-results/base/report.json \
+            --current scan-results/pr/report.json \
+            --policy devsecops-tool/security-policy.json \
+            --out scan-results/gate
+          cat scan-results/gate/summary.md
+
+      - name: Upload scan and gate reports
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: devsecops-pr-reports
+          path: scan-results/
+          retention-days: 7
+          if-no-files-found: warn
