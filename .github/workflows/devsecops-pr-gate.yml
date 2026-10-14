@@ -16,8 +16,6 @@ jobs:
     name: pr-security-gate
     runs-on: ubuntu-24.04
     timeout-minutes: 60
-    env:
-      DEVSECOPS_TOOL_DIR: ${{ runner.temp }}/devsecops-cli
 
     steps:
       - name: Checkout DevSecOps toolkit (trusted separate repository)
