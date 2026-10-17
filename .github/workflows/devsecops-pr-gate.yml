@@ -1,13 +1,14 @@
-# Copy this file to .github/workflows/devsecops-pr-gate.yml
-# in Crabs536/wrongsecrets (master branch).
-# The toolkit stays in the separate public repo Crabs536/DevSecOps_Pipeline.
+# Milestone 3: GitHub Actions Summary + PR comment.
+# Install as .github/workflows/devsecops-pr-gate.yml in Crabs536/wrongsecrets.
+# Scanner logic stays in Crabs536/DevSecOps_Pipeline (main).
 name: DevSecOps PR Security Gate
 
 on:
   pull_request:
     branches: [master]
+    types: [opened, synchronize, reopened]
 
-# Do not use pull_request_target or expose repository secrets to untrusted PRs.
+# Never give write access to the job which processes the PR snapshot.
 permissions:
   contents: read
 
@@ -16,13 +17,14 @@ jobs:
     name: pr-security-gate
     runs-on: ubuntu-24.04
     timeout-minutes: 60
-
+    permissions:
+      contents: read
     steps:
       - name: Checkout DevSecOps toolkit (trusted separate repository)
         uses: actions/checkout@v4
         with:
           repository: Crabs536/DevSecOps_Pipeline
-          ref: main  # POC: pin to an audited commit SHA before production use.
+          ref: main  # POC only: pin to a reviewed commit SHA for production.
           path: devsecops-tool
           persist-credentials: false
 
@@ -78,6 +80,7 @@ jobs:
             --fail-on none \
             --jobs 4
 
+      # Keep the original exit code: FAIL must still make this job fail.
       - name: Evaluate PR security gate
         shell: bash
         run: |
@@ -86,7 +89,25 @@ jobs:
             --current scan-results/pr/report.json \
             --policy devsecops-tool/security-policy.json \
             --out scan-results/gate
-          cat scan-results/gate/summary.md
+
+      # Even if the evaluation step fails, the summary must be visible.
+      - name: Publish GitHub Actions summary
+        if: always()
+        shell: bash
+        env:
+          PR_NUMBER: ${{ github.event.pull_request.number }}
+        run: |
+          {
+            echo "## DevSecOps Security Report - PR #${PR_NUMBER}"
+            echo ""
+            echo "[View workflow run](https://github.com/${GITHUB_REPOSITORY}/actions/runs/${GITHUB_RUN_ID})"
+            echo ""
+            if [ -f scan-results/gate/summary.md ]; then
+              cat scan-results/gate/summary.md
+            else
+              echo "**ERROR:** Security Gate report was not generated. Check the preceding scanner logs."
+            fi
+          } >> "$GITHUB_STEP_SUMMARY"
 
       - name: Upload scan and gate reports
         if: always()
@@ -96,3 +117,76 @@ jobs:
           path: scan-results/
           retention-days: 7
           if-no-files-found: warn
+
+  # Optional convenience for same-repository PRs ONLY. No PR code is checked
+  # out or executed in this job. Fork-origin PRs deliberately skip commenting.
+  pr-report-comment:
+    name: pr-report-comment
+    needs: pr-security-gate
+    if: ${{ always() && github.event.pull_request.head.repo.full_name == github.repository }}
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    permissions:
+      actions: read
+      pull-requests: write
+    steps:
+      - name: Download DevSecOps report
+        uses: actions/download-artifact@v4
+        continue-on-error: true
+        with:
+          name: devsecops-pr-reports
+          path: pr-reports
+
+      - name: Create or update PR comment
+        uses: actions/github-script@v7
+        continue-on-error: true
+        with:
+          github-token: ${{ secrets.GITHUB_TOKEN }}
+          script: |
+            const fs = require('fs');
+            const marker = '<!-- devsecops-pr-gate-report -->';
+            const reportPath = 'pr-reports/gate/summary.md';
+            let report = fs.existsSync(reportPath)
+              ? fs.readFileSync(reportPath, 'utf8')
+              : '**ERROR:** The gate report is unavailable. See the workflow logs.';
+            if (report.length > 24000) {
+              report = report.slice(0, 24000) + '\n\n_The comment was truncated. Download the full report artifact from Actions._';
+            }
+
+            const runUrl = `https://github.com/${context.repo.owner}/${context.repo.repo}/actions/runs/${context.runId}`;
+            const body = [
+              marker,
+              '## DevSecOps PR Security Gate',
+              report,
+              `[View workflow run and download full reports](${runUrl})`,
+              '_This comment is updated automatically on each PR scan._'
+            ].join('\n\n');
+
+            const params = {
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              issue_number: context.payload.pull_request.number
+            };
+            const comments = await github.paginate(github.rest.issues.listComments, {
+              ...params,
+              per_page: 100
+            });
+            const previous = comments.find(c =>
+              c.user?.login === 'github-actions[bot]' && c.body?.includes(marker)
+            );
+
+            if (previous) {
+              await github.rest.issues.updateComment({
+                owner: params.owner,
+                repo: params.repo,
+                comment_id: previous.id,
+                body
+              });
+              core.info(`Updated PR report comment #${previous.id}`);
+            } else {
+              const result = await github.rest.issues.createComment({
+                ...params,
+                body
+              });
+              core.info(`Created PR report comment #${result.data.id}`);
+            }
