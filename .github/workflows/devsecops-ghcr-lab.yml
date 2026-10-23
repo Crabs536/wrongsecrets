@@ -1,0 +1,153 @@
+# Milestone 6: private, manual lab publishing only. Do not deploy.
+# The OWASP WrongSecrets image intentionally includes known vulnerabilities.
+name: DevSecOps GHCR Private Lab Publish
+
+on:
+  workflow_dispatch: {}
+
+permissions:
+  contents: read
+
+concurrency:
+  group: devsecops-ghcr-lab-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  publish-private-lab-image:
+    name: publish-private-lab-image
+    runs-on: ubuntu-24.04
+    timeout-minutes: 90
+    # Never publish from a feature branch or from a pull request event.
+    if: ${{ github.ref == 'refs/heads/master' && github.ref_protected && github.event_name == 'workflow_dispatch' }}
+    environment: ghcr-lab-release
+    permissions:
+      contents: read
+      packages: write
+    steps:
+      - name: Checkout protected master commit
+        uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
+        with:
+          ref: ${{ github.sha }}
+          path: source
+          persist-credentials: false
+
+      - name: Checkout trusted DevSecOps toolkit
+        uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
+        with:
+          repository: Crabs536/DevSecOps_Pipeline
+          ref: ec3021f356935d6d377c3e017ae0a4954f324be4 # pinned toolkit main
+          path: devsecops-tool
+          persist-credentials: false
+
+      - name: Ensure the Log4j test fixture was removed
+        shell: bash
+        run: |
+          set -euo pipefail
+          test -f source/Dockerfile
+          if grep -q 'DEVSECOPS M5 LAB ONLY' source/Dockerfile; then
+            echo '[ERROR] M5 intentionally vulnerable Log4j test fixture is still present' >&2
+            exit 1
+          fi
+
+      - name: Set up JDK 26
+        uses: actions/setup-java@b843ebf9b913146b38da2eaa7aeddf76074ae1ad # v6
+        with:
+          distribution: temurin
+          java-version: '26'
+
+      - name: Set up Python
+        uses: actions/setup-python@ece7cb06caefa5fff74198d8649806c4678c61a1 # v6
+        with:
+          python-version: '3.11'
+
+      - name: Install Trivy v0.76.1
+        uses: aquasecurity/setup-trivy@e07451d2e059ed86c2870430ea286b3a9e0bf241
+        with:
+          version: v0.76.1
+          cache: true
+
+      - name: Verify build and scan tools
+        shell: bash
+        run: |
+          set -euo pipefail
+          test -f devsecops-tool/examples/wrongsecrets/build_and_scan.sh
+          java --version
+          docker --version
+          trivy --version
+
+      - name: Build lab image and scan before publishing
+        shell: bash
+        run: |
+          set -euo pipefail
+          LOCAL_TAG="wrongsecrets-m6-lab:sha-${GITHUB_SHA}"
+          bash devsecops-tool/examples/wrongsecrets/build_and_scan.sh \
+            source "$LOCAL_TAG" scan-results/release/trivy.json
+          echo "LOCAL_TAG=$LOCAL_TAG" >> "$GITHUB_ENV"
+
+      - name: Display accepted security debt and verify Trivy JSON
+        shell: bash
+        run: |
+          set -euo pipefail
+          python3 - <<'PY'
+          import collections
+          import json
+          import os
+          from pathlib import Path
+          path = Path('scan-results/release/trivy.json')
+          data = json.loads(path.read_text(encoding='utf-8'))
+          assert isinstance(data.get('SchemaVersion'), int), 'Missing Trivy schema version'
+          assert isinstance(data.get('Results'), list), 'Missing Trivy results'
+          vulnerabilities = [v for r in data['Results'] for v in (r.get('Vulnerabilities') or [])]
+          counts = collections.Counter(str(v.get('Severity') or 'UNKNOWN').upper() for v in vulnerabilities)
+          summary = [
+              '## Private GHCR lab image - scan before publish',
+              '',
+              '**WARNING:** OWASP WrongSecrets intentionally contains vulnerabilities.',
+              'This run does not claim that the image is production-safe.',
+              'It must remain private and must not be deployed to a public endpoint.',
+              '',
+              f'- Total vulnerability records: **{len(vulnerabilities)}**',
+              f'- CRITICAL: **{counts["CRITICAL"]}**; HIGH: **{counts["HIGH"]}**',
+              f'- MEDIUM: **{counts["MEDIUM"]}**; UNKNOWN: **{counts["UNKNOWN"]}**',
+              '- These are current-image results, not a new-CVE-vs-baseline comparison.',
+              '',
+          ]
+          text = '\n'.join(summary)
+          print(text)
+          with open(os.environ['GITHUB_STEP_SUMMARY'], 'a', encoding='utf-8') as f:
+              f.write(text)
+          PY
+
+      # Only log in after source, build and Trivy scan have completed.
+      - name: Authenticate to GHCR with built-in GITHUB_TOKEN
+        shell: bash
+        env:
+          GHCR_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -euo pipefail
+          printf '%s' "$GHCR_TOKEN" | docker login ghcr.io -u "$GITHUB_ACTOR" --password-stdin
+
+      - name: Push immutable lab-only tag to GHCR
+        shell: bash
+        run: |
+          set -euo pipefail
+          IMAGE="ghcr.io/crabs536/wrongsecrets-devsecops-lab:sha-${GITHUB_SHA}"
+          docker tag "$LOCAL_TAG" "$IMAGE"
+          docker push "$IMAGE"
+          echo "" >> "$GITHUB_STEP_SUMMARY"
+          echo "Published package: \`$IMAGE\`" >> "$GITHUB_STEP_SUMMARY"
+          echo "**Verify package visibility is Private in GitHub Packages. Do not deploy.**" >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Upload Trivy report
+        if: always()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: devsecops-ghcr-lab-trivy-report
+          path: scan-results/release/trivy.json
+          if-no-files-found: warn
+          retention-days: 7
+
+      - name: Log out of GHCR
+        if: always()
+        shell: bash
+        run: docker logout ghcr.io || true
