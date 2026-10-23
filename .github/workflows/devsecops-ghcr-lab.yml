@@ -3,12 +3,7 @@
 name: DevSecOps GHCR Private Lab Publish
 
 on:
-  workflow_dispatch:
-    inputs:
-      release_ack:
-        description: 'Type PUBLISH_LAB_ONLY to acknowledge this is a deliberately vulnerable lab image'
-        required: true
-        type: string
+  workflow_dispatch: {}
 
 permissions:
   contents: read
@@ -23,36 +18,24 @@ jobs:
     runs-on: ubuntu-24.04
     timeout-minutes: 90
     # Never publish from a feature branch or from a pull request event.
-    if: ${{ github.ref == 'refs/heads/master' && github.event_name == 'workflow_dispatch' }}
+    if: ${{ github.ref == 'refs/heads/master' && github.ref_protected && github.event_name == 'workflow_dispatch' }}
     environment: ghcr-lab-release
     permissions:
       contents: read
       packages: write
     steps:
-      - name: Confirm manual lab-only publication
-        shell: bash
-        env:
-          RELEASE_ACK: ${{ inputs.release_ack }}
-        run: |
-          set -euo pipefail
-          if [[ "$RELEASE_ACK" != "PUBLISH_LAB_ONLY" ]]; then
-            echo "[ERROR] Exact confirmation PUBLISH_LAB_ONLY is required" >&2
-            exit 1
-          fi
-          echo 'Private lab publication was explicitly requested.'
-
       - name: Checkout protected master commit
-        uses: actions/checkout@v6
+        uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
         with:
           ref: ${{ github.sha }}
           path: source
           persist-credentials: false
 
       - name: Checkout trusted DevSecOps toolkit
-        uses: actions/checkout@v6
+        uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
         with:
           repository: Crabs536/DevSecOps_Pipeline
-          ref: main # For production, replace with a reviewed 40-character commit SHA.
+          ref: ec3021f356935d6d377c3e017ae0a4954f324be4 # pinned toolkit main
           path: devsecops-tool
           persist-credentials: false
 
@@ -67,13 +50,13 @@ jobs:
           fi
 
       - name: Set up JDK 26
-        uses: actions/setup-java@v6
+        uses: actions/setup-java@b843ebf9b913146b38da2eaa7aeddf76074ae1ad # v6
         with:
           distribution: temurin
           java-version: '26'
 
       - name: Set up Python
-        uses: actions/setup-python@v6
+        uses: actions/setup-python@ece7cb06caefa5fff74198d8649806c4678c61a1 # v6
         with:
           python-version: '3.11'
 
@@ -157,7 +140,7 @@ jobs:
 
       - name: Upload Trivy report
         if: always()
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
         with:
           name: devsecops-ghcr-lab-trivy-report
           path: scan-results/release/trivy.json
