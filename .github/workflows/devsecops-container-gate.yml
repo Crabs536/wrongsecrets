@@ -1,0 +1,131 @@
+# Milestone 5: image build + Trivy baseline comparison. GitHub-hosted ephemeral runner.
+# Install into Crabs536/wrongsecrets/.github/workflows/devsecops-container-gate.yml
+# Put container_gate.py, container-security-policy.json and build_and_scan.sh
+# into Crabs536/DevSecOps_Pipeline first (see README_VI.md).
+name: DevSecOps Container Security Gate
+
+on:
+  pull_request:
+    branches: [master]
+    types: [opened, synchronize, reopened]
+
+permissions:
+  contents: read
+
+concurrency:
+  group: container-security-${{ github.event.pull_request.number }}
+  cancel-in-progress: true
+
+jobs:
+  container-security-gate:
+    name: container-security-gate
+    runs-on: ubuntu-24.04
+    timeout-minutes: 90
+    permissions:
+      contents: read
+    steps:
+      - name: Checkout trusted DevSecOps toolkit
+        uses: actions/checkout@v4
+        with:
+          repository: Crabs536/DevSecOps_Pipeline
+          ref: main # POC only: pin this to a reviewed full commit SHA for production.
+          path: devsecops-tool
+          persist-credentials: false
+
+      - name: Checkout baseline (PR target master commit)
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ github.event.pull_request.base.sha }}
+          path: baseline
+          persist-credentials: false
+
+      - name: Checkout PR test-merge snapshot
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ github.sha }}
+          path: candidate
+          persist-credentials: false
+
+      - name: Set up JDK 26 for WrongSecrets
+        uses: actions/setup-java@v6
+        with:
+          distribution: temurin
+          java-version: '26'
+
+      - name: Set up Python
+        uses: actions/setup-python@v6
+        with:
+          python-version: '3.11'
+
+      - name: Install Trivy v0.76.1
+        uses: aquasecurity/setup-trivy@e07451d2e059ed86c2870430ea286b3a9e0bf241
+        with:
+          version: v0.76.1
+          cache: true
+
+      - name: Verify container security toolkit
+        shell: bash
+        run: |
+          set -euo pipefail
+          test -f devsecops-tool/container_gate.py
+          test -f devsecops-tool/container-security-policy.json
+          test -f devsecops-tool/examples/wrongsecrets/build_and_scan.sh
+          java --version
+          docker --version
+          trivy --version
+          python devsecops-tool/container_gate.py self-test
+
+      # No application is started or exposed to the network. The Dockerfile is
+      # intentionally vulnerable: use ONLY a synthetic BuildKit secret.
+      - name: Build and scan baseline image
+        shell: bash
+        run: |
+          set -euo pipefail
+          bash devsecops-tool/examples/wrongsecrets/build_and_scan.sh \
+            baseline wrongsecrets-m5-base:ci \
+            scan-results/base/trivy.json
+
+      - name: Build and scan PR image
+        shell: bash
+        run: |
+          set -euo pipefail
+          bash devsecops-tool/examples/wrongsecrets/build_and_scan.sh \
+            candidate wrongsecrets-m5-pr:ci \
+            scan-results/pr/trivy.json
+
+      - name: Evaluate container security gate
+        shell: bash
+        run: |
+          set -euo pipefail
+          python devsecops-tool/container_gate.py compare \
+            --baseline scan-results/base/trivy.json \
+            --current scan-results/pr/trivy.json \
+            --policy devsecops-tool/container-security-policy.json \
+            --out scan-results/gate
+
+      - name: Publish container security summary
+        if: always()
+        shell: bash
+        env:
+          PR_NUMBER: ${{ github.event.pull_request.number }}
+        run: |
+          {
+            echo "## DevSecOps Container Security - PR #${PR_NUMBER}"
+            echo ""
+            echo "[View workflow run](https://github.com/${GITHUB_REPOSITORY}/actions/runs/${GITHUB_RUN_ID})"
+            echo ""
+            if [ -f scan-results/gate/summary.md ]; then
+              cat scan-results/gate/summary.md
+            else
+              echo "**ERROR:** Could not produce the container gate report. Inspect Docker build / Trivy logs."
+            fi
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Upload Trivy reports and gate result
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: devsecops-container-reports
+          path: scan-results/
+          retention-days: 7
+          if-no-files-found: warn
