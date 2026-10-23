@@ -1,0 +1,120 @@
+# Milestone 7 — safe, ephemeral smoke staging for the deliberately vulnerable WrongSecrets image.
+# No app ports exposed, no external deployment; never execute PR branch code here.
+name: DevSecOps M7 Isolated Staging Smoke
+
+on:
+  workflow_dispatch: {}
+  workflow_run:
+    workflows: ["DevSecOps GHCR Private Lab Publish"]
+    types: [completed]
+
+permissions:
+  contents: read
+  packages: read
+
+concurrency:
+  group: devsecops-m7-${{ github.repository }}
+  cancel-in-progress: false
+
+jobs:
+  staging-smoke:
+    name: staging-smoke
+    if: >-
+      (github.event_name == 'workflow_dispatch' && github.ref == 'refs/heads/master') ||
+      (github.event_name == 'workflow_run' &&
+       github.event.workflow_run.conclusion == 'success' &&
+       github.event.workflow_run.event == 'workflow_dispatch' &&
+       github.event.workflow_run.head_branch == 'master' &&
+       github.event.workflow_run.repository.full_name == github.repository)
+    runs-on: ubuntu-24.04
+    timeout-minutes: 120
+    permissions:
+      contents: read
+      packages: read
+    steps:
+      - name: Resolve image and validate trusted toolkit pin
+        shell: bash
+        env:
+          EVENT_TYPE: ${{ github.event_name }}
+          RELEASE_SHA: ${{ github.event.workflow_run.head_sha }}
+          MANUAL_SHA: ${{ vars.DEVSECOPS_M7_RELEASE_SHA }}
+          TOOLKIT_PIN: ${{ vars.DEVSECOPS_M7_TOOLKIT_SHA }}
+        run: |
+          set -euo pipefail
+          mkdir -p staging-reports
+          if [[ "$EVENT_TYPE" == "workflow_run" ]]; then
+            SHA="$RELEASE_SHA"
+          else
+            SHA="$MANUAL_SHA"
+          fi
+          if ! [[ "$SHA" =~ ^[0-9a-f]{40}$ ]]; then
+            echo "[M7][CONFIG][FAIL] Set repository variable DEVSECOPS_M7_RELEASE_SHA to the 40-char SHA used in a successful GHCR publish." | tee staging-reports/preflight-error.txt
+            exit 1
+          fi
+          if ! [[ "$TOOLKIT_PIN" =~ ^[0-9a-f]{40}$ ]]; then
+            echo "[M7][CONFIG][FAIL] Set repository variable DEVSECOPS_M7_TOOLKIT_SHA to a reviewed toolkit commit SHA." | tee staging-reports/preflight-error.txt
+            exit 1
+          fi
+          echo "IMAGE=ghcr.io/crabs536/wrongsecrets-devsecops-lab:sha-${SHA}" >> "$GITHUB_ENV"
+          echo "[M7][CONFIG][PASS] Release SHA ${SHA}; Toolkit SHA ${TOOLKIT_PIN}"
+
+      # The toolkit reference is an immutable 40-character SHA from a repo variable.
+      - name: Checkout pinned DevSecOps toolkit
+        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+        with:
+          repository: Crabs536/DevSecOps_Pipeline
+          ref: ${{ vars.DEVSECOPS_M7_TOOLKIT_SHA }}
+          path: devsecops-tool
+          persist-credentials: false
+
+      - name: Validate staging script
+        shell: bash
+        run: |
+          set -euo pipefail
+          python3 -m py_compile devsecops-tool/staging_smoke.py
+          python3 devsecops-tool/staging_smoke.py self-test
+          python3 devsecops-tool/staging_smoke.py doctor
+
+      # Trivy already scanned this exact image before M6 publish; M7 verifies startup, not CVE policy.
+      - name: Pull Private GHCR image and perform isolated smoke test
+        shell: bash
+        timeout-minutes: 95
+        env:
+          GHCR_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          GHCR_USERNAME: ${{ github.actor }}
+        run: |
+          set -euo pipefail
+          python3 devsecops-tool/staging_smoke.py run \
+            --image "$IMAGE" \
+            --report-dir staging-reports \
+            --health-path / \
+            --pull-timeout 1800 \
+            --health-timeout 600 \
+            --interval 8
+
+      - name: Publish diagnostics to Actions Summary
+        if: always()
+        shell: bash
+        run: |
+          {
+            echo '## Milestone 7 - Isolated staging smoke'
+            echo ''
+            if [ -f staging-reports/summary.md ]; then
+              cat staging-reports/summary.md
+            elif [ -f staging-reports/preflight-error.txt ]; then
+              echo '### Configuration failure'
+              echo ''
+              cat staging-reports/preflight-error.txt
+            else
+              echo '**No report was created.** See job setup logs.'
+            fi
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Upload diagnostic reports (no raw app logs)
+        if: always()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: devsecops-m7-diagnostics
+          path: staging-reports/
+          if-no-files-found: warn
+          retention-days: 7
