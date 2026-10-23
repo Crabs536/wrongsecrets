@@ -83,3 +83,7 @@ RUN adduser -u 2000 -D wrongsecrets
 USER wrongsecrets
 
 CMD java -jar -XX:SharedArchiveFile=application.jsa -Dspring.profiles.active=$(echo ${SPRING_PROFILES_ACTIVE}) -Dspringdoc.swagger-ui.enabled=${SPRINGDOC_UI} -Dspringdoc.api-docs.enabled=${SPRINGDOC_DOC} -D application.jar
+
+# DEVSECOPS M5 LAB ONLY - intentionally vulnerable library
+# Do not merge or deploy this image.
+ADD https://repo.maven.apache.org/maven2/org/apache/logging/log4j/log4j-core/2.14.1/log4j-core-2.14.1.jar /opt/devsecops-lab/log4j-core-2.14.1.jar
